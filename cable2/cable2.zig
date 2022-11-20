@@ -33,6 +33,11 @@ const Context = struct{
     dbg_audio_transfer_record_idx:usize = 0,
     dbg_audio_transfer_play_idx:usize = 0,
 
+    // threads
+
+    audio_sending_threads:std.ArrayListAligned(std.Thread,null) = undefined,
+    audio_receiving_threads:std.ArrayListAligned(std.Thread,null) = undefined,
+
     // settings
 
     global_volume:f32 = 1.0, // can go higher than 1
@@ -56,6 +61,7 @@ pub fn main() !u8 {
 
     // cmd hashmap
     // TODO do this at compile time ?
+    // TODO put in seperate file?
     var commands_hashmap = std.StringHashMap(@TypeOf(cmd_test)).init(alloc);
     defer commands_hashmap.deinit();
 
@@ -63,6 +69,8 @@ pub fn main() !u8 {
     try commands_hashmap.put("start-recording", cmd_start_recording);
     try commands_hashmap.put("stop-recording", cmd_stop_recording);
     try commands_hashmap.put("start-playing", cmd_start_playing);
+    try commands_hashmap.put("wait-for-connection", cmd_wait_for_connection);
+    try commands_hashmap.put("connect", cmd_connect);
 
     // context
     var ctx = Context{
@@ -81,14 +89,20 @@ pub fn main() !u8 {
         }
     }
 
-    // might as well do it here
+    // might as well start recording
     try cmd_start_recording(&ctx);
     defer cmd_stop_recording(&ctx) catch {
         print("ERROR: cannot stop recording\n", .{}) catch {};
     };
 
-    try cmd_start_playing(&ctx);
+    // debug
+    //try cmd_start_playing(&ctx);
     // TODO cmd_stop_playing
+
+    ctx.audio_sending_threads = std.ArrayList(std.Thread).init(alloc);
+    defer ctx.audio_sending_threads.deinit();
+    ctx.audio_receiving_threads = std.ArrayList(std.Thread).init(alloc);
+    defer ctx.audio_receiving_threads.deinit();
 
     // the "main menu"
     var stdin_buf:[200]u8 = undefined;
@@ -212,6 +226,10 @@ fn cmd_start_recording(ctx:*Context) !void {
 
     const thr = try std.Thread.spawn(.{}, recording_thr, .{ctx});
     ctx.record_thr = thr;
+
+    //std.Thread
+    const sex:std.ArrayListAligned(std.Thread,null) = std.ArrayList(std.Thread).init(ctx.alloc);
+    _ = sex;
 }
 
 fn cmd_stop_recording(ctx:*Context) !void {
@@ -341,4 +359,112 @@ fn cmd_start_playing(ctx:*Context) !void {
             ctx.dbg_audio_transfer_play_idx = idx;
         }
     }
+}
+
+fn cmd_wait_for_connection(ctx:*Context) !void {
+    // TODO make it so that the receiver of the connection gets his voice recorded ? or not ?
+
+    var host = std.net.StreamServer.init(.{.reuse_address=true});
+    defer host.deinit();
+
+    const addr_str = "0.0.0.0"; // TODO make into a setting?
+    const port = 6969; // TODO make into a setting?
+    const addr = try std.net.Address.resolveIp(addr_str, port); // can also use parseIp4 parseIp6
+
+    try print("waiting for connection...\n", .{});
+    try host.listen(addr);
+
+    const con = try host.accept();
+    try print("connection from `{}`\n", .{con}); // TODO con.addr
+
+    const stream = con.stream;
+
+    var idx_play:usize = ctx.dbg_audio_transfer_record_idx;
+    // TODO can make this into a new thread
+    while(true){
+        // TODO very shit, needs to be fixed
+
+        const idx_record = ctx.dbg_audio_transfer_record_idx;
+
+        if(idx_record == idx_play){
+            continue;
+        }
+        
+        const data = ctx.dbg_audio_transfer[idx_play];
+
+        // TODO do some audio processing before sending? maybe it's best if we do that in the recording thread, or maybe we should enable doing it on a per-connection basis
+
+        // TODO encryption
+
+        {
+            // const len = comptime sex: {
+            //     break :sex (@floatToInt(comptime_int, FRAMES_PER_BUFFER) * 4);
+            // };
+            const data_as_u8 = @ptrCast(*const[]u8, @alignCast(8, data[0..]));
+            _ = try stream.write(data_as_u8.*); // TODO can check reutrn just ot be sure
+        }
+
+        idx_play += 1;
+        idx_play %= ctx.dbg_audio_transfer.len;
+
+    }
+
+}
+
+fn thr_send_audio(ctx:*Context, stream:u1) !void { // TODO rename the other SOMETHING_thr to thr_SOMETHING
+
+    defer stream.close();
+
+    var idx_play:usize = ctx.dbg_audio_transfer_record_idx;
+    while(!ctx.record_stopped){
+        const idx_record = ctx.dbg_audio_transfer_record_idx;
+        if(idx_record == idx_play){
+            continue;
+        }
+        
+        const data = ctx.dbg_audio_transfer[idx_play];
+
+        // TODO do some audio processing before sending? maybe it's best if we do that in the recording thread, or maybe we should enable doing it on a per-connection basis
+
+        // TODO encryption
+
+        _ = try stream.write(data); // TODO can check reutrn just ot be sure
+
+        idx_play += 1;
+        idx_play %= ctx.dbg_audio_transfer.len;
+    }
+}
+
+fn cmd_connect(ctx:*Context) !void {
+    var args = ctx.args;
+
+    const addr_str = args.next() orelse {
+        try print("you need to specify address\n", .{});
+        return;
+    };
+    const port_str = args.next() orelse {
+        try print("you need to specify port\n", .{});
+        return;
+    };
+    if(args.next() != null){
+        try print("too much arguments provided\n", .{});
+        return;
+    }
+
+    const port = std.fmt.parseInt(u16, port_str, 10) catch|err| {
+        try print("invalid port: `{}`: {}\n", .{port_str, err});
+        return;
+    };
+
+    const addr = std.net.Address.resolveIp(addr_str, port) catch|err| {
+        try print("could not resolve address `{}` on port `{}`: {}\n", .{addr_str, port, err});
+        return;
+    };
+
+    var stream = std.net.tcpConnectToAddress(addr) catch|err| {
+        try print("could not connect to address `{}` on port `{}`: {}\n", .{addr, port, err});
+        return;
+    };
+
+    try std.Thread.spawn(thr_send_audio, &stream);
 }
